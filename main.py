@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
-"""Aruco‑based trampoline deflection tracker.
+"""Aruco-based trampoline deflection tracker.
 
 Usage (terminal):
-    python aruco_trampoline_tracker.py \
-        --video  "path/to/input.mov" \
-        --dict   DICT_6X6_1000 \
+    python main.py \
+        --video "/ścieżka/do/1.mov" \
+        --dict  DICT_6X6_1000 \
         --marker-id 2
 
-The script:
-1.  Ładuje nagranie wideo (lub kamerę: --video 0).
-2.  Wykrywa podany (lub pierwszy napotkany) znacznik ArUco.
-3.  Śledzi jego środek klatka po klatce, zapisując wyniki do CSV.
-4.  Rysuje obwiednię + środek i zapisuje wideo *output_annotated.mp4*.
-5.  Po zakończeniu generuje wykres pionowego wychylenia.
-
-Zależności:  opencv‑contrib‑python, pandas, matplotlib, numpy.
+Domyślnie (bez parametrów) wczyta plik /Users/bartlomiejostasz/lot/n/git/1.mov.
+Wymaga: opencv-contrib-python, pandas, matplotlib, numpy.
 """
 from __future__ import annotations
 
@@ -24,10 +18,10 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import cv2  # type: ignore
-import matplotlib.pyplot as plt  # type: ignore
-import numpy as np  # type: ignore
-import pandas as pd  # type: ignore
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 
 # ---------------------------------------------------------------------------
 # Stałe i funkcje pomocnicze
@@ -40,16 +34,29 @@ ARUCO_DICTS: Dict[str, int] = {
 }
 
 
+def auto_detect_dict_and_id(video_path: str | int) -> Tuple[str, int]:
+    """Przeskanuj pierwszą klatkę i zwróć (dict_name, marker_id)."""
+    cap = cv2.VideoCapture(video_path)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        raise ValueError("Nie udało się odczytać pierwszej klatki.")
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    for name, code in ARUCO_DICTS.items():
+        aruco_dict = cv2.aruco.getPredefinedDictionary(code)
+        detector = cv2.aruco.ArucoDetector(aruco_dict)
+        corners, ids, _ = detector.detectMarkers(gray)
+        if ids is not None and len(ids):
+            return name, int(ids[0][0])
+    raise ValueError("Nie znaleziono markera w pierwszej klatce żadnym słownikiem.")
+
+
 def compute_real_offset_cm(
     px: float,
     image_width: int,
     horizontal_fov_deg: float = 60.0,
     distance_cm: float = 120.0,
 ) -> float:
-    """Przybliżone przesunięcie boczne w cm z pikseli.
-
-    Zakładamy prostą geometrię perspektywy:  tan(theta) = offset / distance.
-    """
     deg_per_pixel = horizontal_fov_deg / image_width
     dx_pixels = px - (image_width / 2.0)
     angle_rad = math.radians(dx_pixels * deg_per_pixel)
@@ -82,10 +89,19 @@ class ArucoTrampolineTracker:
             self._tuned_parameters(),
         )
         self.out_video = out_video
+        # --- Tracker CSRT fallback ---
+        try:
+            self.tracker_csrt = cv2.TrackerCSRT_create()
+        except AttributeError:
+            self.tracker_csrt = cv2.legacy.TrackerCSRT_create()
+        self.track_mode = False          # True = CSRT, False = ArUco
+        self.lost_counter = 0
+        self.lost_thresh = 1             # 1 klatka przerwy → CSRT
+        self.last_bbox = None
+        self.csrt_ready = False          # czy tracker został zainicjalizowany
 
     @staticmethod
-    def _tuned_parameters() -> cv2.aruco.DetectorParameters:  # type: ignore[name-defined]
-        """Zwrot parametrów detektora dostrojonych do słabego oświetlenia / małych markerów."""
+    def _tuned_parameters() -> cv2.aruco.DetectorParameters:
         params = cv2.aruco.DetectorParameters()
         params.adaptiveThreshConstant = 7
         params.minMarkerPerimeterRate = 0.02
@@ -98,17 +114,18 @@ class ArucoTrampolineTracker:
     def run(self) -> None:
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
-            sys.exit("❌  Nie można otworzyć pliku wideo / kamery.")
+            sys.exit("❌ Nie można otworzyć pliku wideo / kamery.")
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        w, h = (
-            int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-            int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        w, h = int(cap.get(3)), int(cap.get(4))
+        writer = cv2.VideoWriter(
+            str(self.out_video),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (w, h),
         )
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(self.out_video), fourcc, fps, (w, h))
 
-        records: List[Tuple[float, float, float]] = []  # (t, cx, cy)
+        records: List[Tuple[float, float, float]] = []
         frame_idx = 0
         first_center: Tuple[float, float] | None = None
 
@@ -120,44 +137,79 @@ class ArucoTrampolineTracker:
             timestamp = frame_idx / fps
             corners, ids, _ = self.detector.detectMarkers(frame)
 
-            if ids is not None:
+            # --------- ArUco widoczny ---------
+            if ids is not None and len(ids):
+                self.lost_counter = 0
                 ids = ids.flatten()
                 chosen_idx = 0
                 if self.marker_id is not None:
-                    indices = np.where(ids == self.marker_id)[0]
-                    if len(indices):
-                        chosen_idx = int(indices[0])
+                    matches = np.where(ids == self.marker_id)[0]
+                    if len(matches):
+                        chosen_idx = int(matches[0])
                     else:
-                        # marker o podanym ID nieobecny w tej klatce
-                        ids = None
-                if ids is not None:
+                        ids = None  # brak oczekiwanego ID
+
+                if ids is not None and len(ids):
                     c = corners[chosen_idx][0]
                     cx, cy = c.mean(axis=0)
+
+                    # bbox + margines
+                    pad = 15
+                    x_min, y_min = np.min(c, axis=0)
+                    x_max, y_max = np.max(c, axis=0)
+                    x_min = max(0, int(x_min) - pad)
+                    y_min = max(0, int(y_min) - pad)
+                    x_max = min(w - 1, int(x_max) + pad)
+                    y_max = min(h - 1, int(y_max) + pad)
+                    bbox = (x_min, y_min, max(2, x_max - x_min), max(2, y_max - y_min))
+                    self.last_bbox = bbox
+
+                    # Inicjalizacja CSRT tylko jeśli potrzeba
+                    if self.track_mode or not self.csrt_ready:
+                        try:
+                            self.tracker_csrt = cv2.TrackerCSRT_create()
+                        except AttributeError:
+                            self.tracker_csrt = cv2.legacy.TrackerCSRT_create()
+                        self.tracker_csrt.init(frame, bbox)
+                        self.csrt_ready = True
+                    self.track_mode = False
+
                     if first_center is None:
                         first_center = (cx, cy)
-                    # rysuj
                     cv2.polylines(frame, [c.astype(int)], True, (0, 255, 0), 2)
                     cv2.circle(frame, (int(cx), int(cy)), 4, (0, 0, 255), -1)
                     records.append((timestamp, cx, cy))
                     cv2.putText(
-                        frame,
-                        f"id={ids[chosen_idx]}",
+                        frame, f"id={ids[chosen_idx]}",
                         (int(cx) + 10, int(cy) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (0, 255, 0),
-                        1,
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1
                     )
-            else:
-                cv2.putText(
-                    frame,
-                    "LOST",
-                    (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0,
-                    (0, 0, 255),
-                    2,
-                )
+                else:
+                    ids = None  # przeskok do fallback
+
+            # --------- ArUco niewidoczny ---------
+            if ids is None:
+                self.lost_counter += 1
+                if self.last_bbox and self.lost_counter >= self.lost_thresh:
+                    self.track_mode = True
+
+                if self.track_mode and self.csrt_ready:
+                    ok_track, new_bbox = self.tracker_csrt.update(frame)
+                else:
+                    ok_track = False
+
+                if ok_track:
+                    x, y, w_box, h_box = new_bbox
+                    cx, cy = x + w_box / 2, y + h_box / 2
+                    cv2.rectangle(
+                        frame, (int(x), int(y)),
+                        (int(x + w_box), int(y + h_box)), (255, 0, 0), 2
+                    )
+                    cv2.circle(frame, (int(cx), int(cy)), 4, (255, 0, 0), -1)
+                    records.append((timestamp, cx, cy))
+                else:
+                    cv2.putText(frame, "LOST", (20, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
 
             writer.write(frame)
             cv2.imshow("Aruco tracker", frame)
@@ -165,19 +217,15 @@ class ArucoTrampolineTracker:
                 break
             frame_idx += 1
 
-        # Cleanup
         cap.release()
         writer.release()
         cv2.destroyAllWindows()
 
         if not records:
             sys.exit("❌  Nie odnotowano ani jednego wystąpienia markera.")
-
         self._postprocess(records, first_center, w)
 
-    # -----------------------------------------
-    # Post‑processing: CSV + wykres
-    # -----------------------------------------
+    # ----------------------------------------- post-processing -----------------------------------------
 
     def _postprocess(
         self,
@@ -194,7 +242,6 @@ class ArucoTrampolineTracker:
             df["offset_cm"] = df["cx"].apply(
                 lambda x: compute_real_offset_cm(x, image_width)
             )
-
             plt.figure(figsize=(10, 5))
             plt.plot(df["time_s"], df["dy_px"], label="Δy [px]")
             plt.xlabel("Czas [s]")
@@ -216,19 +263,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Automatyczny tracker markera ArUco")
     parser.add_argument(
         "--video",
-        default="0",
-        help="Ścieżka do pliku wideo lub 0 (domyślnie) dla kamerki",
+        default="/Users/bartlomiejostasz/lot/n/git/1.mov",
+        help="Ścieżka do pliku wideo (domyślnie ten plik); podaj 0, aby użyć kamerki",
     )
     parser.add_argument(
         "--dict",
-        default="DICT_6X6_1000",
-        help="Nazwa słownika ArUco (np. DICT_4X4_50)",
+        default="AUTO",
+        help="Nazwa słownika ArUco (np. DICT_4X4_50) lub AUTO do samodetekcji",
     )
     parser.add_argument(
         "--marker-id",
         type=int,
         default=None,
-        help="ID markera do śledzenia (jeśli pusty – pierwszy wykryty)",
+        help="ID markera do śledzenia (jeśli puste – pierwszy wykryty)",
     )
     parser.add_argument(
         "--out",
@@ -240,9 +287,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    video_source: str | int = (
-        int(args.video) if args.video.isdigit() else args.video
-    )
+    video_source: str | int = int(
+        args.video) if args.video.isdigit() else args.video
+    if args.dict == "AUTO":
+        detected_dict, detected_id = auto_detect_dict_and_id(video_source)
+        print(f"🔍 AUTO: znaleziono {detected_dict} / id={detected_id}")
+        args.dict = detected_dict
+        if args.marker_id is None:
+            args.marker_id = detected_id
+
     tracker = ArucoTrampolineTracker(
         video_path=video_source,
         dict_name=args.dict,
