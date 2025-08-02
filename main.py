@@ -12,6 +12,7 @@ import pandas as pd
 from pathlib import Path
 import sys, argparse, math, time
 from typing import List, Tuple, Dict
+from scipy.signal import savgol_filter
 
 # ------------ Ustawienia -------------
 VIDEO_PATH = "/Users/bartlomiejostasz/lot/n/git/1.mov"
@@ -19,8 +20,16 @@ VIDEO_PATH = "/Users/bartlomiejostasz/lot/n/git/1.mov"
 CALIB_PATH = '/Users/bartlomiejostasz/PYCH/LOT/1:5.npz'
 ARUCO_DICT = "DICT_6X6_1000"   # ręcznie lub AUTO w przyszłości
 MARKER_ID  = 2                 # None = pierwszy wykryty
+# tylko ten marker ArUco będzie akceptowany (DICT_6X6_1000, ID 2)
+TARGET_MARKER_ID = 2
 OUT_VIDEO  = "out_annotated.mp4"
 # -------------------------------------
+
+# rzeczywiste parametry pomiarowe — iPhone 15 Pro
+MARKER_SIZE_CM = 3.5
+MARKER_DISTANCE_CM = 300.0
+CAMERA_HFOV_DEG = 73.7     # pole widzenia poziome w stopniach
+SENSOR_WIDTH_PX = 4032     # szerokość zdjęcia w px (pełne 48 MP)
 
 # słowniki OpenCV
 ARUCO_DICTS: Dict[str, int] = {
@@ -33,7 +42,6 @@ class ArucoTracker:
     def __init__(self,
                  video_path: str | int,
                  dict_name: str,
-                 marker_id: int | None,
                  out_path: str,
                  camera_matrix=None,
                  dist_coeffs=None) -> None:
@@ -48,7 +56,6 @@ class ArucoTracker:
 
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICTS[dict_name])
         self.detector = cv2.aruco.ArucoDetector(self.aruco_dict)
-        self.marker_id = marker_id
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self.writer = cv2.VideoWriter(out_path, fourcc, self.fps, (self.w, self.h))
@@ -64,7 +71,7 @@ class ArucoTracker:
         self.lost_counter = 0
         self.lost_thresh  = 1
 
-        self.records: List[Tuple[float,float,float,float | None]] = []
+        self.records: List[Tuple[float,float,float,float | None, float | None]] = []
         self.first_center: Tuple[float,float] | None = None
 
         self.K = camera_matrix
@@ -77,22 +84,37 @@ class ArucoTracker:
         while True:
             ok, frame = self.cap.read()
             if not ok: break
+            # Undistort frame if calibration is available
+            if self.K is not None and self.D is not None:
+                frame = cv2.undistort(frame, self.K, self.D)
             t = frame_idx / self.fps
 
             corners, ids, _ = self.detector.detectMarkers(frame)
             if ids is not None and len(ids):
                 ids = ids.flatten()
                 idx = 0
-                if self.marker_id is not None:
-                    matches = np.where(ids == self.marker_id)[0]
-                    if len(matches): idx = int(matches[0])
-                    else: ids = None  # nie ten ID
+                # sprawdź tylko czy wśród wykrytych jest dokładnie marker o ID = 2
+                matches = np.where(ids == TARGET_MARKER_ID)[0]
+                if len(matches):
+                    idx = int(matches[0])
+                else:
+                    ids = None  # nie znaleziono właściwego markera
 
             # ---- ArUco widoczny ----
             if ids is not None and len(ids):
                 self.lost_counter = 0
                 c = corners[idx][0]
                 cx, cy = c.mean(axis=0)
+
+                if self.first_center is None:
+                    self.first_center = (cx, cy)
+
+                dx_px = cx - self.first_center[0]
+                dy_px = self.first_center[1] - cy
+                # przeliczenie ruchu markera w px → cm na podstawie FOV i szerokości klatki
+                scene_width_cm = 2 * MARKER_DISTANCE_CM * math.tan(math.radians(CAMERA_HFOV_DEG / 2))
+                cm_per_px = scene_width_cm / SENSOR_WIDTH_PX
+                dy_real_cm = dy_px * cm_per_px  # teraz: ujemne = w dół
 
                 # --- pozycja 3‑D dzięki kalibracji ---
                 if self.K is not None and self.D is not None:
@@ -125,10 +147,9 @@ class ArucoTracker:
                     self.csrt_ready = True
                 self.track_mode = False
 
-                if self.first_center is None: self.first_center = (cx, cy)
                 cv2.polylines(frame, [c.astype(int)], True, (0,255,0), 2)
                 cv2.circle(frame, (int(cx),int(cy)), 4, (0,0,255), -1)
-                self.records.append((t, cx, cy, z_cm))
+                self.records.append((t, cx, cy, z_cm, dy_real_cm))
             else:
                 # ---- fallback CSRT ----
                 self.lost_counter += 1
@@ -145,7 +166,15 @@ class ArucoTracker:
                         w, h = nw, nh
                         cv2.rectangle(frame,(x,y),(x+w,y+h),(255,0,0),2)
                         cv2.circle(frame,(int(cx),int(cy)),4,(255,0,0),-1)
-                        self.records.append((t, cx, cy, None))
+                        # --- compute dy_px and dy_real_cm for fallback CSRT tracking ---
+                        if self.first_center is not None:
+                            dy_px = self.first_center[1] - cy
+                            scene_width_cm = 2 * MARKER_DISTANCE_CM * math.tan(math.radians(CAMERA_HFOV_DEG / 2))
+                            cm_per_px = scene_width_cm / SENSOR_WIDTH_PX
+                            dy_real_cm = dy_px * cm_per_px
+                        else:
+                            dy_real_cm = None
+                        self.records.append((t, cx, cy, None, dy_real_cm))
                     else:
                         cv2.putText(frame,"LOST",(20,40),cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),2)
                 else:
@@ -162,10 +191,14 @@ class ArucoTracker:
     # ---------------------------------
     def _postprocess(self)->None:
         if not self.records: return
-        df = pd.DataFrame(self.records, columns=["t","cx","cy","z_cm"])
+        df = pd.DataFrame(self.records, columns=["t","cx","cy","z_cm","dy_cm"])
         # Δy: dodatnie w górę, ujemne w dół
         df["dy_px"] = self.first_center[1] - df["cy"]
-        df.to_csv("positions_px.csv", index=False)
+        # Interpolacja rzeczywistego przemieszczenia pionowego
+        df["dy_cm_interp"] = df["dy_cm"].interpolate(method="linear")
+
+        # Eksport pełnych danych do CSV
+        df.to_csv("positions_full.csv", index=False)
 
         plt.figure(figsize=(8,4))
         plt.plot(df["t"], df["dy_px"])
@@ -185,7 +218,44 @@ class ArucoTracker:
             plt.savefig("deflection_z_cm.png", dpi=150)
             plt.show()
 
-        print("✔ zapisano positions_px.csv i deflection_px.png")
+        if df["dy_cm"].notna().any():
+            plt.figure(figsize=(8,4))
+            plt.plot(df["t"], df["dy_cm"], label="ΔY [cm]")
+            plt.xlabel("Czas [s]"); plt.ylabel("ΔY [cm]")
+            plt.title("Wychylenie pionowe markera (przybliżone)")
+            plt.grid(); plt.tight_layout()
+            plt.savefig("deflection_dy_cm.png", dpi=150)
+            plt.show()
+
+        # Nowy wykres dla interpolowanego przemieszczenia pionowego (dy_cm_interp)
+        if df["dy_cm_interp"].notna().any():
+            plt.figure(figsize=(8,4))
+            plt.plot(df["t"], df["dy_cm_interp"], label="ΔY [cm] (interpolowane)", color="green")
+            plt.axhline(0, color="gray", lw=0.8)
+            plt.xlabel("Czas [s]"); plt.ylabel("ΔY [cm]")
+            plt.title("Interpolowane wychylenie pionowe markera")
+            plt.grid(); plt.tight_layout()
+            plt.savefig("deflection_dy_cm_interp.png", dpi=150)
+            plt.show()
+
+        # Savitzky-Golay smoothing for dy_cm_interp
+        if df["dy_cm_interp"].notna().sum() > 10:
+            df["dy_cm_smooth"] = savgol_filter(df["dy_cm_interp"], window_length=21, polyorder=3)
+        else:
+            df["dy_cm_smooth"] = df["dy_cm_interp"]
+
+        # Final plot for smoothed dy_cm
+        if df["dy_cm_smooth"].notna().any():
+            plt.figure(figsize=(8,4))
+            plt.plot(df["t"], df["dy_cm_smooth"], label="ΔY [cm] (wygładzone)", color="darkgreen")
+            plt.axhline(0, color="gray", lw=0.8)
+            plt.xlabel("Czas [s]"); plt.ylabel("ΔY [cm]")
+            plt.title("Wychylenie pionowe markera (cm, wygładzone)")
+            plt.grid(); plt.tight_layout()
+            plt.savefig("deflection_dy_cm_smooth.png", dpi=150)
+            plt.show()
+
+        print("✔ zapisano positions_full.csv i deflection_px.png")
 
 # ------------- uruchomienie ----------
 if __name__ == "__main__":
@@ -202,7 +272,6 @@ if __name__ == "__main__":
     ArucoTracker(
         video_path=VIDEO_PATH,
         dict_name=ARUCO_DICT,
-        marker_id=MARKER_ID,
         out_path=OUT_VIDEO,
         camera_matrix=K,
         dist_coeffs=D
