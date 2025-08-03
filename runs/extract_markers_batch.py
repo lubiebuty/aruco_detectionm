@@ -20,9 +20,6 @@ if not os.path.isfile(args.weights):
 
 yolo_model = YOLO(args.weights)   # ścieżka do wytrenowanego modelu 3‑klasowego
 
-# Kalman dla każdej roli (2=Left, 3=Center, 4=Right)
-role_kf = {2: _new_kf(), 3: _new_kf(), 4: _new_kf()}
-
 GATE_PX = 80      # maksymalna zmiana cx, aby zachować ten sam ID
 
 kalmans = {}
@@ -34,6 +31,9 @@ def _new_kf():
     kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
     kf.measurementNoiseCov = np.eye(2, dtype=np.float32)*1
     return kf
+
+# ---- Kalman filters initialised after function definition ----
+role_kf = {2: _new_kf(), 3: _new_kf(), 4: _new_kf()}
 
 def overlay_markers(video_path: str, csv_path: str, output_path: str):
     cap = cv2.VideoCapture(video_path)

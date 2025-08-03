@@ -1,0 +1,45 @@
+*.csv
+*.png
+*.mov
+*.mp4
+*.pt
+*.pth
+*.jpg
+*.jpeg
+*.idea/
+marker_dataset/
+
+runs/detect/
+
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Environment variables
+.env
+
+# VS Code settings
+.vscode/
+
+# macOS and Linux hidden files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Testing
+.coverage
+.pytest_cache/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
