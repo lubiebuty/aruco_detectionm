@@ -14,8 +14,10 @@ import sys, argparse, math, time
 from typing import List, Tuple, Dict
 from scipy.signal import savgol_filter
 
+from ultralytics import YOLO
+
 # ------------ Ustawienia -------------
-VIDEO_PATH = "/Users/bartlomiejostasz/lot/n/git/1.mov"
+VIDEO_PATH = "/Users/bartlomiejostasz/lot/n/3klatki/IMG_4699.MOV"
 # plik kalibracyjny kamery (macierz K i dystorsja)
 CALIB_PATH = '/Users/bartlomiejostasz/PYCH/LOT/1:5.npz'
 ARUCO_DICT = "DICT_6X6_1000"   # ręcznie lub AUTO w przyszłości
@@ -23,6 +25,25 @@ MARKER_ID  = 2                 # None = pierwszy wykryty
 # tylko ten marker ArUco będzie akceptowany (DICT_6X6_1000, ID 2)
 TARGET_MARKER_ID = 2
 OUT_VIDEO  = "out_annotated.mp4"
+REFRESH_INTERVAL = 10
+HOLD_FRAMES = 20        # ile klatek „trzymamy” ostatni punkt gdy tracker zgubi marker
+PIXEL_MARGIN = 10          # stała: powiększamy bbox o 10 px z każdej strony
+
+# ----------- Fusion validation constants ----------
+EPSILON_PIX = 5         # tolerancja rogów – luźniej o 2 px
+BETA_RATIO  = 0.40      # środek ArUco może odjechać do 40 % bbox
+
+ENLARGE_FAC = 1.5      # factor to enlarge bbox when re‑initialising
+
+# ----------- Bbox size limit -----------
+MAX_BBOX_FRAC = 0.20   # bbox area may occupy max 20 % całej klatki
+
+COLOR_ARUCO_BOX = (255, 0, 0)   # blue box around exact ArUco marker
+COLOR_ARUCO_CENTER = (0, 0, 255)  # red dot at ArUco center
+# -------------------------------------
+
+# ścieżka do wytrenowanego modelu YOLOv8
+YOLO_MODEL_PATH = "runs/detect/train7/weights/best.pt"   # ścieżka do wytrenowanego modelu YOLOv8
 # -------------------------------------
 
 # rzeczywiste parametry pomiarowe — iPhone 15 Pro
@@ -57,6 +78,11 @@ class ArucoTracker:
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICTS[dict_name])
         self.detector = cv2.aruco.ArucoDetector(self.aruco_dict)
 
+        # YOLOv8 – wykrywanie trzech markerów (marker_left, marker_center, marker_right)
+        self.yolo = YOLO(YOLO_MODEL_PATH)
+        # mapowanie indeksu klasy => marker_id (rid)
+        self.class2rid = {0: 2, 1: 3, 2: 4}   # YOLO klasa 0→ID2, 1→ID3, 2→ID4
+
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self.writer = cv2.VideoWriter(out_path, fourcc, self.fps, (self.w, self.h))
 
@@ -77,116 +103,228 @@ class ArucoTracker:
         self.K = camera_matrix
         self.D = dist_coeffs
 
+        self.initialized = False
+        self.cm_per_px_fixed = None
+        self.centers: Dict[int, np.ndarray] = {}
+
+        self.bboxes: Dict[int, Tuple[float,float,float,float]] = {}  # rid → (x,y,w,h)
+        self.aruco_corners: Dict[int, np.ndarray] = {}              # rid → 4×2 corners
+
+        self.trackers: Dict[int, cv2.Tracker] = {}
+        self.last_seen = {}
+
     # ---------------------------------
+    def _bbox_from_corners(self, corners: np.ndarray) -> Tuple[float,float,float,float]:
+        """Tight bbox (+PIXEL_MARGIN) around 4×2 corners."""
+        xs, ys = corners[:,0], corners[:,1]
+        x_min = max(xs.min() - PIXEL_MARGIN, 0)
+        y_min = max(ys.min() - PIXEL_MARGIN, 0)
+        x_max = min(xs.max() + PIXEL_MARGIN, self.w)
+        y_max = min(ys.max() + PIXEL_MARGIN, self.h)
+        return (x_min, y_min, x_max - x_min, y_max - y_min)
+
     def run(self) -> None:
         frame_idx = 0
         start = time.time()
         while True:
             ok, frame = self.cap.read()
-            if not ok: break
+            if not ok:
+                break
             # Undistort frame if calibration is available
             if self.K is not None and self.D is not None:
                 frame = cv2.undistort(frame, self.K, self.D)
             t = frame_idx / self.fps
 
-            corners, ids, _ = self.detector.detectMarkers(frame)
-            if ids is not None and len(ids):
-                ids = ids.flatten()
-                idx = 0
-                # sprawdź tylko czy wśród wykrytych jest dokładnie marker o ID = 2
-                matches = np.where(ids == TARGET_MARKER_ID)[0]
-                if len(matches):
-                    idx = int(matches[0])
-                else:
-                    ids = None  # nie znaleziono właściwego markera
-
-            # ---- ArUco widoczny ----
-            if ids is not None and len(ids):
-                self.lost_counter = 0
-                c = corners[idx][0]
-                cx, cy = c.mean(axis=0)
-
-                if self.first_center is None:
-                    self.first_center = (cx, cy)
-
-                dx_px = cx - self.first_center[0]
-                dy_px = self.first_center[1] - cy
-                # przeliczenie ruchu markera w px → cm na podstawie FOV i szerokości klatki
-                scene_width_cm = 2 * MARKER_DISTANCE_CM * math.tan(math.radians(CAMERA_HFOV_DEG / 2))
-                cm_per_px = scene_width_cm / SENSOR_WIDTH_PX
-                dy_real_cm = dy_px * cm_per_px  # teraz: ujemne = w dół
-
-                # --- pozycja 3‑D dzięki kalibracji ---
-                if self.K is not None and self.D is not None:
-                    rvec, tvec, _ = cv2.aruco.estimatePoseSingleMarkers(
-                        [c], 0.04, self.K, self.D)  # marker 4 cm
-                    z_cm = tvec[0][0][2] * 100      # metr → cm
-                else:
-                    z_cm = None
-
-                # -- pełny bbox z paddingiem --
-                pad = 15
-                x_min, y_min = np.min(c, axis=0)
-                x_max, y_max = np.max(c, axis=0)
-                x_min = max(0, int(x_min) - pad)
-                y_min = max(0, int(y_min) - pad)
-                x_max = min(self.w - 1, int(x_max) + pad)
-                y_max = min(self.h - 1, int(y_max) + pad)
-                bbox = (
-                    x_min,
-                    y_min,
-                    max(2, x_max - x_min),
-                    max(2, y_max - y_min),
-                )
-                self.last_bbox = bbox
-
-                if self.track_mode or not self.csrt_ready:
-                    try: self.tracker = cv2.TrackerCSRT_create()
-                    except AttributeError: self.tracker = cv2.legacy.TrackerCSRT_create()
-                    self.tracker.init(frame, bbox)
-                    self.csrt_ready = True
-                self.track_mode = False
-
-                cv2.polylines(frame, [c.astype(int)], True, (0,255,0), 2)
-                cv2.circle(frame, (int(cx),int(cy)), 4, (0,0,255), -1)
-                self.records.append((t, cx, cy, z_cm, dy_real_cm))
-            else:
-                # ---- fallback CSRT ----
-                self.lost_counter += 1
-                if self.csrt_ready and self.lost_counter >= self.lost_thresh:
+            if not self.initialized:
+                # --- YOLO wykrywa trzy markery ---
+                yolo_res = self.yolo.predict(source=frame, conf=0.25, iou=0.5, device="mps", verbose=False)
+                dets = yolo_res[0]
+                # filtrowanie tylko klas 0..2
+                found = {int(cls): box.xyxy[0].cpu().numpy() for cls, box in zip(dets.boxes.cls, dets.boxes)}
+                if all(k in found for k in (0,1,2)):
+                    required_ids = [2,3,4]   # trzy markery (L,C,R); odpowiadają klasom YOLO 0,1,2
+                    self.trackers = {}
+                    for cls_idx, rid in self.class2rid.items():
+                        x1,y1,x2,y2 = found[cls_idx]
+                        # powiększ bbox o stały margines 10 px na każdą stronę
+                        x_min = max(x1 - PIXEL_MARGIN, 0)
+                        y_min = max(y1 - PIXEL_MARGIN, 0)
+                        x_max = min(x2 + PIXEL_MARGIN, self.w)
+                        y_max = min(y2 + PIXEL_MARGIN, self.h)
+                        bbox = (x_min, y_min, x_max - x_min, y_max - y_min)
+                        try:
+                            tracker = cv2.legacy.TrackerCSRT_create()
+                        except AttributeError:
+                            tracker = cv2.TrackerCSRT_create()
+                        tracker.init(frame, bbox)
+                        self.trackers[rid] = tracker
+                        self.bboxes[rid] = bbox
+                    self.initialized = True
                     self.track_mode = True
-                if self.track_mode and self.csrt_ready:
-                    ok_t, nbbox = self.tracker.update(frame)
-                    if ok_t:
-                        cx, cy, w, h = nbbox[0] + nbbox[2]/2, nbbox[1] + nbbox[3]/2, nbbox[2], nbbox[3]
-                        scale = 1.20
-                        nw, nh = int(w * scale), int(h * scale)
-                        x = int(cx - nw/2)
-                        y = int(cy - nh/2)
-                        w, h = nw, nh
-                        cv2.rectangle(frame,(x,y),(x+w,y+h),(255,0,0),2)
-                        cv2.circle(frame,(int(cx),int(cy)),4,(255,0,0),-1)
-                        # --- compute dy_px and dy_real_cm for fallback CSRT tracking ---
-                        if self.first_center is not None:
-                            dy_px = self.first_center[1] - cy
-                            scene_width_cm = 2 * MARKER_DISTANCE_CM * math.tan(math.radians(CAMERA_HFOV_DEG / 2))
-                            cm_per_px = scene_width_cm / SENSOR_WIDTH_PX
-                            dy_real_cm = dy_px * cm_per_px
-                        else:
-                            dy_real_cm = None
-                        self.records.append((t, cx, cy, None, dy_real_cm))
-                    else:
-                        cv2.putText(frame,"LOST",(20,40),cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),2)
+                    # start reference = środek markera 3 (YOLO klasa 1)
+                    x1,y1,x2,y2 = found[1]
+                    c3x = (x1 + x2)/2; c3y = (y1 + y2)/2
+                    self.first_center = (c3x, c3y)
+                    self.centers = {}
                 else:
-                    cv2.putText(frame,"LOST",(20,40),cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),2)
+                    # Rysuj wykrycia YOLO (tylko podgląd)
+                    for box, cls in zip(dets.boxes, dets.boxes.cls):
+                        x1,y1,x2,y2 = box.xyxy[0]
+                        cv2.rectangle(frame, (int(x1),int(y1)), (int(x2),int(y2)), (0,255,255), 2)
+                        cv2.putText(frame, f"YOLO {int(cls)}", (int(x1), int(y1)-5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+            else:
+                # Update trackers for each marker
+                updated_centers = {}
+
+                # ------ ArUco detection for precise center & overlay ------
+                corners, ids, _ = self.detector.detectMarkers(frame)
+                if ids is not None and len(ids):
+                    ids_arr = ids.flatten().astype(int)
+                    for marker_corners, marker_id in zip(corners, ids_arr):
+                        if marker_id in (2, 3, 4):   # tylko nasze markery
+                            pts = marker_corners[0].astype(int)
+                            cv2.polylines(frame, [pts], True, COLOR_ARUCO_BOX, 2)
+                            ar_center = pts.mean(axis=0)
+                            cv2.circle(frame, tuple(ar_center.astype(int)), 4, COLOR_ARUCO_CENTER, -1)
+                            # nadpisz center jeśli to dokładniejszy pomiar
+                            updated_centers[marker_id] = tuple(ar_center)
+                            self.aruco_corners[marker_id] = marker_corners[0]
+                            # --- re‑init tracker from exact ArUco if missing ---
+                            tight_bbox = self._bbox_from_corners(marker_corners[0])
+                            if marker_id not in self.trackers:
+                                try:
+                                    tracker = cv2.legacy.TrackerCSRT_create()
+                                except AttributeError:
+                                    tracker = cv2.TrackerCSRT_create()
+                                tracker.init(frame, tight_bbox)
+                                self.trackers[marker_id] = tracker
+                                self.bboxes[marker_id] = tight_bbox
+
+                lost_trackers = []
+                for rid, tracker in self.trackers.items():
+                    ok, bbox = tracker.update(frame)
+                    if ok:
+                        x,y,w,h = bbox
+                        p1 = (int(x), int(y))
+                        p2 = (int(x + w), int(y + h))
+                        cv2.rectangle(frame, p1, p2, (255,0,0), 2)
+                        center = (x + w/2, y + h/2)
+                        self.last_seen[rid] = {"frame": self.frame_idx, "center": center}
+                        updated_centers[rid] = center
+                        self.bboxes[rid] = bbox
+                        cv2.putText(frame, f"ID: {rid}", (int(center[0]+5), int(center[1]-5)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+                    else:
+                        if rid in self.last_seen and self.frame_idx - self.last_seen[rid]["frame"] <= HOLD_FRAMES:
+                            center = self.last_seen[rid]["center"]
+                            updated_centers[rid] = center
+                            x, y = center
+                            last_bbox = self.bboxes.get(rid, (0,0,60,60))
+                            w = last_bbox[2] * 0.5
+                            h = last_bbox[3] * 0.5
+                            p1 = (int(x - w/2), int(y - h/2))
+                            p2 = (int(x + w/2), int(y + h/2))
+                            cv2.rectangle(frame, p1, p2, (0,0,255), 2)
+                            cv2.circle(frame, (int(x), int(y)), 4, (0,0,255), -1)
+                            cv2.putText(frame, f"ID: {rid} (hold)", (int(x+5), int(y-5)),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+                        else:
+                            lost_trackers.append(rid)
+                # For lost trackers or refresh interval, try YOLO fallback detection
+                if lost_trackers or (self.frame_idx % REFRESH_INTERVAL == 0):
+                    yolo_res = self.yolo.predict(source=frame, conf=0.25, iou=0.5, device="mps", verbose=False)
+                    dets = yolo_res[0]
+                    for cls_idx, rid in self.class2rid.items():
+                        if rid in lost_trackers or self.frame_idx % REFRESH_INTERVAL == 0:
+                            mask = (dets.boxes.cls.int() == cls_idx)
+                            if mask.any():
+                                box = dets.boxes[mask][0]
+                                x1,y1,x2,y2 = box.xyxy[0].cpu().numpy()
+                                x_min = max(x1 - PIXEL_MARGIN, 0)
+                                y_min = max(y1 - PIXEL_MARGIN, 0)
+                                x_max = min(x2 + PIXEL_MARGIN, self.w)
+                                y_max = min(y2 + PIXEL_MARGIN, self.h)
+                                bbox = (x_min, y_min, x_max - x_min, y_max - y_min)
+                                try:
+                                    tracker = cv2.legacy.TrackerCSRT_create()
+                                except AttributeError:
+                                    tracker = cv2.TrackerCSRT_create()
+                                tracker.init(frame, bbox)
+                                self.trackers[rid] = tracker
+                                self.bboxes[rid] = bbox
+                                updated_centers[rid] = ((x1 + x2)/2, (y1 + y2)/2)
+
+                # -------- fusion validation: ensure ArUco lies inside bbox --------
+                for rid in (2,3,4):
+                    if rid in self.bboxes and rid in self.aruco_corners:
+                        bbox   = self.bboxes[rid]
+                        x,y,w,h = bbox
+                        x2,y2 = x+w, y+h
+                        ar_corners = self.aruco_corners[rid]
+                        # check all corners
+                        corners_ok = all(
+                            (x - EPSILON_PIX) <= cx <= (x2 + EPSILON_PIX) and
+                            (y - EPSILON_PIX) <= cy <= (y2 + EPSILON_PIX)
+                            for (cx,cy) in ar_corners
+                        )
+                        # check center deviation
+                        if rid in updated_centers:
+                            cx, cy = updated_centers[rid]
+                            center_ok = (
+                                abs((x + w/2) - cx) <= w * BETA_RATIO and
+                                abs((y + h/2) - cy) <= h * BETA_RATIO
+                            )
+                        else:
+                            center_ok = True
+                        # limit bbox size; if too large, replace by tight bbox around ArUco
+                        bbox_area = w * h
+                        if bbox_area > MAX_BBOX_FRAC * self.w * self.h:
+                            new_bbox = self._bbox_from_corners(ar_corners)
+                            try:
+                                tracker = cv2.legacy.TrackerCSRT_create()
+                            except AttributeError:
+                                tracker = cv2.TrackerCSRT_create()
+                            tracker.init(frame, new_bbox)
+                            self.trackers[rid] = tracker
+                            self.bboxes[rid] = new_bbox
+                            continue
+                        if not (corners_ok and center_ok):
+                            # re‑init tracker to tight bbox around ArUco (plus margin)
+                            new_bbox = self._bbox_from_corners(ar_corners)
+                            try:
+                                tracker = cv2.legacy.TrackerCSRT_create()
+                            except AttributeError:
+                                tracker = cv2.TrackerCSRT_create()
+                            tracker.init(frame, new_bbox)
+                            self.trackers[rid] = tracker
+                            self.bboxes[rid] = new_bbox
+
+                self.centers = updated_centers
+
+                # Record data only for marker 3 if available
+                if 3 in self.centers:
+                    cx, cy = self.centers[3]
+                    if self.first_center is None:
+                        self.first_center = (cx, cy)
+                    # Calculate dy in pixels (positive up)
+                    dy_px = self.first_center[1] - cy
+                    # Convert to cm using fixed scale if available
+                    z_cm = None
+                    dy_cm = None
+                    if self.cm_per_px_fixed is not None:
+                        dy_cm = dy_px * self.cm_per_px_fixed
+                    self.records.append((t, cx, cy, z_cm, dy_cm))
 
             self.writer.write(frame)
             cv2.imshow("tracker", frame)
             if cv2.waitKey(1)&0xFF==27: break
             frame_idx += 1
+            self.frame_idx = frame_idx
 
         self.cap.release(); self.writer.release(); cv2.destroyAllWindows()
-        self._postprocess()
+        # self._postprocess()
+        print("✔ YOLO + CSRT tracking zakończone")
 
     # ---------------------------------
     def _postprocess(self)->None:
