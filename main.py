@@ -43,7 +43,7 @@ COLOR_ARUCO_CENTER = (0, 0, 255)  # red dot at ArUco center
 # -------------------------------------
 
 # ścieżka do wytrenowanego modelu YOLOv8
-YOLO_MODEL_PATH = "runs/detect/train7/weights/best.pt"   # ścieżka do wytrenowanego modelu YOLOv8
+YOLO_MODEL_PATH = "/Users/bartlomiejostasz/PYCH/aruco_detection/runs/detect/train8/weights/best.pt"  # ścieżka do wytrenowanego modelu YOLOv8
 # -------------------------------------
 
 # rzeczywiste parametry pomiarowe — iPhone 15 Pro
